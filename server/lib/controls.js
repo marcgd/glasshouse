@@ -7,6 +7,8 @@ var listenDualStack = require('./util').listenDualStack;
 var execFile = require('child_process').execFile;
 var msg = require('./say').msg;
 var timers = require('./timers');
+var saverPowerOff = require('./saverpoweroff');
+var clock = require('./clock');
 var names = require('./names');
 
 /*
@@ -602,6 +604,22 @@ function doControl(action, value, cb) {
       return luna('com.webos.service.settings/setSystemSettings',
                   { category: 'option', settings: { quickStartMode: qbOn ? 'on' : 'off' } },
                   function (r) {
+                    if (homeModule) homeModule.syncAutoLaunch();
+                    telemetry.clearCache();
+                    cb({ ok: !!(r && r.returnValue) });
+                  });
+
+    case 'homeAutoLaunch':
+      var halOn = (value === true || value === 'on' || value === 'ON' || value === 'true');
+      if (homeModule) {
+        return homeModule.setAutoLaunch(halOn, function (r) {
+          telemetry.clearCache();
+          cb(r);
+        });
+      }
+      return luna('com.webos.service.settings/setSystemSettings',
+                  { category: 'general', settings: { homeAutoLaunch: halOn ? 'on' : 'off' } },
+                  function (r) {
                     telemetry.clearCache();
                     cb({ ok: !!(r && r.returnValue) });
                   });
@@ -713,6 +731,13 @@ function doControl(action, value, cb) {
                     telemetry.clearCache();
                     cb({ ok: !!(r && r.returnValue) });
                   });
+
+    /*
+     * systemservice's timeFormat preference (HH12 or HH24), which sets the hour
+     * cycle for every clock Glasshouse draws and persists in systemprefs.db.
+     */
+    case 'clockHour12':
+      return clock.set(value, cb, luna);
 
     case 'wakeOnLan':
       var wolOn = (value === true || value === 'on' || value === 'ON' || value === 'true');
@@ -942,6 +967,22 @@ function doControl(action, value, cb) {
         cb(getUpdateSummary());
       });
 
+    // Poweroff after: minutes of screen saver before standby, 0 or blank for off.
+    case 'screensaverPowerOff':
+      var offMin = saverPowerOff.parseMinutes(value);
+      if (offMin === null) return cb({ ok: false, error: msg('srv.saver.powerOff.bad', 'Poweroff after takes a number of minutes from 1 to {max}, or blank for off', { max: saverPowerOff.MAX_MINUTES }) });
+      if (!writeSettingsFn) return cb({ ok: false, error: 'no writeSettings handler configured' });
+      // Off leaves it out of the file.
+      return writeSettingsFn({ screensaverPowerOffMinutes: offMin || undefined }, function (err) {
+        if (err) return cb({ ok: false, error: 'could not save setting: ' + err.message });
+        if (config) {
+          if (offMin) config.screensaverPowerOffMinutes = offMin;
+          else delete config.screensaverPowerOffMinutes;
+        }
+        saverPowerOff.apply();
+        cb({ ok: true, minutes: offMin });
+      });
+
     case 'setWebos10ScreensaversAllowed':
       var allowSs = (value === true || value === 'on' || value === 'true');
       if (!writeSettingsFn) return cb({ ok: false, error: 'no writeSettings handler configured' });
@@ -966,9 +1007,6 @@ function doControl(action, value, cb) {
       var newPort = /^\d{1,5}$/.test(String(value).trim()) ? parseInt(value, 10) : NaN;
       if (!(newPort >= 1024 && newPort <= 65533) || (newPort >= 9996 && newPort <= 9998)) {
         return cb({ ok: false, error: msg('srv.port.invalid', 'The port must be a number from 1024 to 65533, other than 9996 to 9998') });
-      }
-      if (newPort !== 8080 && homeModule && homeModule.enabled()) {
-        return cb({ ok: false, error: msg('srv.port.homeOn', 'Glasshouse Home requires port 8080. Switch Glasshouse Home off before changing the port.') });
       }
       if (config && newPort === config.port) return cb(getUpdateSummary());
       return portIsFree(newPort, function (free) {
@@ -1106,7 +1144,7 @@ function init(opts) {
   if (opts.ntp) ntpModule = opts.ntp;
   if (opts.history) historyModule = opts.history;
   if (opts.backup) backupModule = opts.backup;
-  homeModule = opts.home || null;
+  if (opts.home) homeModule = opts.home;
   if (opts.republishDiscovery) republishDiscoveryFn = opts.republishDiscovery;
   if (opts.tvApp) tvAppFn = opts.tvApp;
   if (opts.restartSelf) restartSelfFn = opts.restartSelf;
